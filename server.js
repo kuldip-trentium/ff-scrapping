@@ -1,5 +1,4 @@
 const http = require("http");
-const axios = require("axios");
 const pool = require("./db");
 const { PORT } = require("./config");
 const puppeteer = require("puppeteer");
@@ -77,8 +76,6 @@ async function processSources(index = 0, sources = []) {
           ];
 
           await pool.execute(updateQuery, normalizeValues(updateValues));
-
-          console.log(`Fixture with id ${fixture.id} updated successfully.`);
         } else {
           // If fixture does not exist, perform an INSERT
           const insertQuery = `
@@ -136,7 +133,7 @@ async function processSources(index = 0, sources = []) {
           VALUES (?, ?, ?, ?, ?, NOW(), NOW())
         `;
             await pool.query(insertHomeTeamQuery, [
-              1,
+              fixture.tournament?.uniqueTournament?.id,
               fixture.homeTeam.name,
               `https://www.sofascore.com/team/football/${fixture.homeTeam.slug}/${fixture.homeTeam.id}`,
               fixture.homeTeam.slug,
@@ -157,7 +154,7 @@ async function processSources(index = 0, sources = []) {
           VALUES (?, ?, ?, ?, ?, NOW(), NOW())
         `;
             await pool.query(insertAwayTeamQuery, [
-              1,
+              fixture.tournament?.uniqueTournament?.id,
               fixture.awayTeam.name,
               `https://www.sofascore.com/team/football/${fixture.awayTeam.slug}/${fixture.awayTeam.id}`,
               fixture.awayTeam.slug,
@@ -306,12 +303,11 @@ async function processSources(index = 0, sources = []) {
       );
       return rows;
     }
+
     async function fetchPaginatedStatistics(tournamentId, seasonId) {
       const limit = 10;
       let offset = 0;
       let hasMore = true;
-
-      console.log(offset, "offset");
 
       while (hasMore) {
         const url = `https://www.sofascore.com/api/v1/unique-tournament/${tournamentId}/season/${seasonId}/statistics?limit=${limit}&offset=${offset}`;
@@ -322,14 +318,13 @@ async function processSources(index = 0, sources = []) {
             return await res.json();
           }, url);
 
-          const delayBetweenRequests = 500;
+          const delayBetweenRequests = 5000;
 
           data?.results?.forEach((player, index) => {
             setTimeout(() => {
               fetchPlayerData(player.player.id);
-            }, index * delayBetweenRequests);
+            }, delayBetweenRequests);
           });
-          console.log(data, "data", offset === data?.pages * 10 - 10, url);
           if (offset === data?.pages * 10 - 10) {
             hasMore = false;
           }
@@ -636,8 +631,11 @@ async function processSources(index = 0, sources = []) {
 
     await processSources(index + 1, sources);
   } catch (error) {
-    console.error(`❌ Error for source ID ${current.id}:`, error.message);
-    await processSources(index + 1, sources); // Continue even if one fails
+    console.error(
+      `❌ Error for source ID ${current.club_identifier}:`,
+      error.message
+    );
+    await processSources(index + 1, sources);
   }
 }
 
