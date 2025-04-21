@@ -647,7 +647,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end(
       JSON.stringify({
-        statusCode: 100,
+        statusCode: 200,
         message: "Processing started in background",
       })
     );
