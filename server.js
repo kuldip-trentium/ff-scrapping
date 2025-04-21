@@ -643,25 +643,36 @@ async function processSources(index = 0, sources = []) {
 
 const server = http.createServer(async (req, res) => {
   if (req.url === "/process-data" && req.method === "GET") {
+    // Send immediate response
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end(
+      JSON.stringify({
+        statusCode: 100,
+        message: "Processing started in background",
+      })
+    );
+
     try {
       const [rows] = await pool.query(
         "SELECT * FROM sofascore_club_scrap ORDER BY id ASC"
       );
 
       if (rows.length === 0) {
-        res.writeHead(200, { "Content-Type": "text/plain" });
-        res.end("No source data to process");
+        console.log("No source data to process");
         return;
       }
 
-      await processSources(0, rows);
-
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("Processing complete");
+      // Run background job
+      setImmediate(async () => {
+        try {
+          await processSources(0, rows);
+          console.log("✅ Background processing complete");
+        } catch (err) {
+          console.error("❌ Error in background job:", err.message);
+        }
+      });
     } catch (err) {
-      console.error(err);
-      res.writeHead(500, { "Content-Type": "text/plain" });
-      res.end("Server Error");
+      console.error("❌ DB Fetch Error:", err.message);
     }
   } else {
     res.writeHead(404, { "Content-Type": "text/plain" });
