@@ -23,6 +23,176 @@ async function processSources(index = 0, sources = []) {
       }
     );
 
+    //to add fixtures
+
+    const saveFixtures = async (fixture) => {
+      const normalizeValues = (arr) =>
+        arr.map((v) => (v === undefined ? null : v));
+
+      try {
+        // Check if the fixture already exists in the database
+        const [existingFixtureRows] = await pool.query(
+          "SELECT id FROM sofascore_fixture WHERE id = ?",
+          [fixture.id]
+        );
+
+        if (existingFixtureRows.length > 0) {
+          // If fixture exists, perform an UPDATE
+          const updateQuery = `
+        UPDATE sofascore_fixture
+        SET 
+          slug = ?, tournament_id = ?, unique_tournament_id = ?, season_id = ?,
+          round_info = ?, status_type = ?, winner_code = ?, home_team = ?, away_team = ?,
+          home_team_score_current = ?, home_team_score_display = ?, home_team_score_period1 = ?,
+          home_team_score_period2 = ?, home_team_score_normal_time = ?, away_team_score_current = ?,
+          away_team_score_display = ?, away_team_score_period1 = ?, away_team_score_period2 = ?,
+          away_team_score_normal_time = ?, current_period_start_timestamp = ?, start_timestamp = ?,
+          updated_at = NOW()
+        WHERE id = ?
+      `;
+
+          const updateValues = [
+            fixture.slug,
+            fixture.tournament?.id,
+            fixture.tournament?.uniqueTournament?.id,
+            fixture.season?.id,
+            fixture.roundInfo?.round,
+            fixture.status?.type,
+            fixture.winnerCode,
+            fixture.homeTeam?.id,
+            fixture.awayTeam?.id,
+            fixture.homeScore?.current,
+            fixture.homeScore?.display,
+            fixture.homeScore?.period1,
+            fixture.homeScore?.period2,
+            fixture.homeScore?.normalTime,
+            fixture.awayScore?.current,
+            fixture.awayScore?.display,
+            fixture.awayScore?.period1,
+            fixture.awayScore?.period2,
+            fixture.awayScore?.normalTime,
+            fixture.startTimestamp,
+            fixture.startTimestamp,
+            fixture.id,
+          ];
+
+          await pool.execute(updateQuery, normalizeValues(updateValues));
+
+          console.log(`Fixture with id ${fixture.id} updated successfully.`);
+        } else {
+          // If fixture does not exist, perform an INSERT
+          const insertQuery = `
+        INSERT INTO sofascore_fixture (
+          id, slug, tournament_id, unique_tournament_id, season_id,
+          round_info, status_type, winner_code, home_team, away_team,
+          home_team_score_current, home_team_score_display,
+          home_team_score_period1, home_team_score_period2,
+          home_team_score_normal_time, away_team_score_current,
+          away_team_score_display, away_team_score_period1,
+          away_team_score_period2, away_team_score_normal_time,
+          current_period_start_timestamp, start_timestamp,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+      `;
+
+          const insertValues = [
+            fixture.id,
+            fixture.slug,
+            fixture.tournament?.id,
+            fixture.tournament?.uniqueTournament?.id,
+            fixture.season?.id,
+            fixture.roundInfo?.round,
+            fixture.status?.type,
+            fixture.winnerCode,
+            fixture.homeTeam?.id,
+            fixture.awayTeam?.id,
+            fixture.homeScore?.current,
+            fixture.homeScore?.display,
+            fixture.homeScore?.period1,
+            fixture.homeScore?.period2,
+            fixture.homeScore?.normalTime,
+            fixture.awayScore?.current,
+            fixture.awayScore?.display,
+            fixture.awayScore?.period1,
+            fixture.awayScore?.period2,
+            fixture.awayScore?.normalTime,
+            fixture.startTimestamp,
+            fixture.startTimestamp,
+          ];
+
+          await pool.execute(insertQuery, normalizeValues(insertValues));
+        }
+
+        // Handle team entries (home and away) in sofascore_club_scrap
+        if (fixture.homeTeam?.id) {
+          const [homeTeamRows] = await pool.query(
+            "SELECT id FROM sofascore_club_scrap WHERE club_identifier = ?",
+            [fixture.homeTeam.id]
+          );
+
+          if (homeTeamRows.length === 0) {
+            const insertHomeTeamQuery = `
+          INSERT INTO sofascore_club_scrap (league_id, club_name, club_link, club_slug, club_identifier, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, NOW(), NOW())
+        `;
+            await pool.query(insertHomeTeamQuery, [
+              1,
+              fixture.homeTeam.name,
+              `https://www.sofascore.com/team/football/${fixture.homeTeam.slug}/${fixture.homeTeam.id}`,
+              fixture.homeTeam.slug,
+              fixture.homeTeam.id,
+            ]);
+          }
+        }
+
+        if (fixture.awayTeam?.id) {
+          const [awayTeamRows] = await pool.query(
+            "SELECT id FROM sofascore_club_scrap WHERE club_identifier = ?",
+            [fixture.awayTeam.id]
+          );
+
+          if (awayTeamRows.length === 0) {
+            const insertAwayTeamQuery = `
+          INSERT INTO sofascore_club_scrap (league_id, club_name, club_link, club_slug, club_identifier, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, NOW(), NOW())
+        `;
+            await pool.query(insertAwayTeamQuery, [
+              1,
+              fixture.awayTeam.name,
+              `https://www.sofascore.com/team/football/${fixture.awayTeam.slug}/${fixture.awayTeam.id}`,
+              fixture.awayTeam.slug,
+              fixture.awayTeam.id,
+            ]);
+          }
+        }
+      } catch (error) {
+        console.error("Insert or update failed:", error.message);
+        throw error;
+      }
+    };
+
+    const fixturePageDetails = await page.evaluate(async (clubId) => {
+      const response = await fetch(
+        `https://www.sofascore.com/api/v1/team/${clubId}/performance/`,
+        {
+          method: "GET",
+          headers: {
+            accept: "application/json",
+          },
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`HTTP error ${response.status}`);
+      }
+
+      return await response.json();
+    }, current.club_identifier);
+
+    await fixturePageDetails.events.map((item) => {
+      saveFixtures(item);
+    });
+
     const body = await page.evaluate(() => document.body.innerText);
 
     //add categories in table sofascore_categories
@@ -52,7 +222,6 @@ async function processSources(index = 0, sources = []) {
      updated_at = VALUES(updated_at)`,
         [category.id, category.name, category.slug, now, now]
       );
-      console.log(`Category saved/updated: ${category.name}`);
     }
 
     //add tournaments in table sofascore_tournaments
@@ -90,7 +259,6 @@ async function processSources(index = 0, sources = []) {
        updated_at = VALUES(updated_at)`,
         [id, name, slug, category_id, unique_tournament_id, now, now]
       );
-      console.log(`Tournament saved/updated: ${name}`);
     }
 
     //add seasons in table sofascore_seasons
@@ -114,7 +282,6 @@ async function processSources(index = 0, sources = []) {
        updated_at = VALUES(updated_at)`,
         [id, name, year, now, now]
       );
-      console.log(`Season saved/updated: ${name}`);
     }
 
     //add seasons in table sofascore_season_tournament_season
@@ -127,10 +294,7 @@ async function processSources(index = 0, sources = []) {
          sofascore_tournament_id = VALUES(sofascore_tournament_id),
          sofascore_season_id = VALUES(sofascore_season_id),
          updated_at = VALUES(updated_at)`,
-          [tournament.id, seasonId, now, now]
-        );
-        console.log(
-          `Tournament-Season entry saved/updated: Tournament ID = ${tournament.id}, Season ID = ${seasonId}`
+          [tournament.uniqueTournament.id, seasonId, now, now]
         );
       }
     }
@@ -147,9 +311,10 @@ async function processSources(index = 0, sources = []) {
       let offset = 0;
       let hasMore = true;
 
+      console.log(offset, "offset");
+
       while (hasMore) {
-        const url = `https://www.sofascore.com/api/v1/unique-tournament/173/season/63807/statistics?limit=10&offset=20`;
-        //TODO: replace url like above https://www.sofascore.com/api/v1/unique-tournament/173/season/63807/statistics?limit=10&offset=20
+        const url = `https://www.sofascore.com/api/v1/unique-tournament/${tournamentId}/season/${seasonId}/statistics?limit=${limit}&offset=${offset}`;
 
         try {
           const data = await page.evaluate(async (apiUrl) => {
@@ -157,25 +322,23 @@ async function processSources(index = 0, sources = []) {
             return await res.json();
           }, url);
 
-          console.log(
-            `Tournament: ${tournamentId}, Season: ${seasonId}, Offset: ${offset}`
-          );
-          // console.log(
-          //   data?.results.map((item) => item.player.id),
-          //   "hellos"
-          // ); // Insert to DB here
+          const delayBetweenRequests = 500;
 
-          fetchPlayerData(962878);
-
-          hasMore = false;
-          //TODO: hasMore = data?.statistics?.length === limit;
+          data?.results?.forEach((player, index) => {
+            setTimeout(() => {
+              fetchPlayerData(player.player.id);
+            }, index * delayBetweenRequests);
+          });
+          console.log(data, "data", offset === data?.pages * 10 - 10, url);
+          if (offset === data?.pages * 10 - 10) {
+            hasMore = false;
+          }
           offset += limit;
         } catch (err) {
           console.error(
             `Puppeteer error for tournament ${tournamentId}, season ${seasonId}:`,
             err.message
           );
-          hasMore = false;
         }
       }
     }
@@ -185,7 +348,7 @@ async function processSources(index = 0, sources = []) {
     async function savePlayerPositions(playerId, positions) {
       for (const position of positions) {
         // 1. Check if position exists
-        const [positionRows] = await db.execute(
+        const [positionRows] = await pool.execute(
           "SELECT id FROM sofascore_position WHERE name = ? LIMIT 1",
           [position]
         );
@@ -194,33 +357,27 @@ async function processSources(index = 0, sources = []) {
 
         if (positionRows.length === 0) {
           // Insert if not exists
-          const [insertResult] = await db.execute(
+          const [insertResult] = await pool.execute(
             "INSERT INTO sofascore_position (name, created_at, updated_at) VALUES (?, NOW(), NOW())",
             [position]
           );
           positionId = insertResult.insertId;
-          console.log(`✅ Inserted new position: ${position}`);
         } else {
           positionId = positionRows[0].id;
-          console.log(`⚠️ Position already exists: ${position}`);
         }
 
         // 2. Insert into sofascore_player_position if not already there
-        const [existingPlayerPosition] = await db.execute(
+        const [existingPlayerPosition] = await pool.execute(
           "SELECT * FROM sofascore_player_position WHERE player_id = ? AND position_id = ? LIMIT 1",
           [playerId, positionId]
         );
 
         if (existingPlayerPosition.length === 0) {
-          await db.execute(
+          await pool.execute(
             "INSERT INTO sofascore_player_position (player_id, position_id, created_at, updated_at) VALUES (?, ?, NOW(), NOW())",
             [playerId, positionId]
           );
-          console.log(`✅ Added player ${playerId} to position ${position}`);
         } else {
-          console.log(
-            `⚠️ Player ${playerId} already linked to position ${position}`
-          );
         }
       }
     }
@@ -240,60 +397,106 @@ async function processSources(index = 0, sources = []) {
         total_shots, yellow_cards, total_rating, count_rating, total_long_balls,
         total_cross, total_passes, shots_from_inside_the_box, appearances,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      )
+      ON DUPLICATE KEY UPDATE
+        accurate_crosses = VALUES(accurate_crosses),
+        accurate_crosses_percentage = VALUES(accurate_crosses_percentage),
+        accurate_long_balls = VALUES(accurate_long_balls),
+        accurate_long_balls_percentage = VALUES(accurate_long_balls_percentage),
+        accurate_passes = VALUES(accurate_passes),
+        accurate_passes_percentage = VALUES(accurate_passes_percentage),
+        aerial_duels_won = VALUES(aerial_duels_won),
+        assists = VALUES(assists),
+        big_chances_created = VALUES(big_chances_created),
+        big_chances_missed = VALUES(big_chances_missed),
+        blocked_shots = VALUES(blocked_shots),
+        clean_sheet = VALUES(clean_sheet),
+        dribbled_past = VALUES(dribbled_past),
+        error_lead_to_goal = VALUES(error_lead_to_goal),
+        expected_assists = VALUES(expected_assists),
+        expected_goals = VALUES(expected_goals),
+        goals = VALUES(goals),
+        goals_assists_sum = VALUES(goals_assists_sum),
+        goals_conceded = VALUES(goals_conceded),
+        interceptions = VALUES(interceptions),
+        key_passes = VALUES(key_passes),
+        minutes_played = VALUES(minutes_played),
+        pass_to_assist = VALUES(pass_to_assist),
+        rating = VALUES(rating),
+        red_cards = VALUES(red_cards),
+        saves = VALUES(saves),
+        shots_on_target = VALUES(shots_on_target),
+        successful_dribbles = VALUES(successful_dribbles),
+        tackles = VALUES(tackles),
+        total_shots = VALUES(total_shots),
+        yellow_cards = VALUES(yellow_cards),
+        total_rating = VALUES(total_rating),
+        count_rating = VALUES(count_rating),
+        total_long_balls = VALUES(total_long_balls),
+        total_cross = VALUES(total_cross),
+        total_passes = VALUES(total_passes),
+        shots_from_inside_the_box = VALUES(shots_from_inside_the_box),
+        appearances = VALUES(appearances),
+        updated_at = NOW()
     `;
 
-        const values = [
+        const rawValues = [
           playerId,
-          data.team.id,
-          data.uniqueTournament.id,
+          data.team?.id,
+          data.uniqueTournament?.id,
           data.year,
-          data.statistics.accurateCrosses,
-          data.statistics.accurateCrossesPercentage,
-          data.statistics.accurateLongBalls,
-          data.statistics.accurateLongBallsPercentage,
-          data.statistics.accuratePasses,
-          data.statistics.accuratePassesPercentage,
-          data.statistics.aerialDuelsWon,
-          data.statistics.assists,
-          data.statistics.bigChancesCreated,
-          data.statistics.bigChancesMissed,
-          data.statistics.blockedShots,
-          data.statistics.cleanSheet,
-          data.statistics.dribbledPast,
-          data.statistics.errorLeadToGoal,
-          data.statistics.expectedAssists,
-          data.statistics.expectedGoals,
-          data.statistics.goals,
-          data.statistics.goalsAssistsSum,
-          data.statistics.goalsConceded,
-          data.statistics.interceptions,
-          data.statistics.keyPasses,
-          data.statistics.minutesPlayed,
-          data.statistics.passToAssist,
-          data.statistics.rating,
-          data.statistics.redCards,
-          data.statistics.saves,
-          data.statistics.shotsOnTarget,
-          data.statistics.successfulDribbles,
-          data.statistics.tackles,
-          data.statistics.totalShots,
-          data.statistics.yellowCards,
-          data.statistics.totalRating,
-          data.statistics.countRating,
-          data.statistics.totalLongBalls,
-          data.statistics.totalCross,
-          data.statistics.totalPasses,
-          data.statistics.shotsFromInsideTheBox,
-          data.statistics.appearances,
+          data.statistics?.accurateCrosses,
+          data.statistics?.accurateCrossesPercentage,
+          data.statistics?.accurateLongBalls,
+          data.statistics?.accurateLongBallsPercentage,
+          data.statistics?.accuratePasses,
+          data.statistics?.accuratePassesPercentage,
+          data.statistics?.aerialDuelsWon,
+          data.statistics?.assists,
+          data.statistics?.bigChancesCreated,
+          data.statistics?.bigChancesMissed,
+          data.statistics?.blockedShots,
+          data.statistics?.cleanSheet,
+          data.statistics?.dribbledPast,
+          data.statistics?.errorLeadToGoal,
+          data.statistics?.expectedAssists,
+          data.statistics?.expectedGoals,
+          data.statistics?.goals,
+          data.statistics?.goalsAssistsSum,
+          data.statistics?.goalsConceded,
+          data.statistics?.interceptions,
+          data.statistics?.keyPasses,
+          data.statistics?.minutesPlayed,
+          data.statistics?.passToAssist,
+          data.statistics?.rating,
+          data.statistics?.redCards,
+          data.statistics?.saves,
+          data.statistics?.shotsOnTarget,
+          data.statistics?.successfulDribbles,
+          data.statistics?.tackles,
+          data.statistics?.totalShots,
+          data.statistics?.yellowCards,
+          data.statistics?.totalRating,
+          data.statistics?.countRating,
+          data.statistics?.totalLongBalls,
+          data.statistics?.totalCross,
+          data.statistics?.totalPasses,
+          data.statistics?.shotsFromInsideTheBox,
+          data.statistics?.appearances,
           new Date(),
           new Date(),
         ];
 
-        await pool.promise().execute(query, values);
-        console.log("✅ Player statistics inserted successfully!");
+        const values = sanitizeValues(rawValues);
+
+        await pool.execute(query, values);
       } catch (err) {
-        console.error("❌ Error inserting player statistics:", err.message);
+        console.error(
+          "❌ Error inserting/updating player statistics:",
+          err.message
+        );
       }
     }
 
@@ -303,13 +506,38 @@ async function processSources(index = 0, sources = []) {
       id, name, first_name, slug, short_name, team_id, tournament_id, unique_tournament_id, position, jersey_number,
       height, preferred_foot, user_count, deceased, gender, country_alpha2, country_alpha3, country_name,
       country_slug, shirt_number, date_of_birth_timestamp, contract_until_timestamp, proposed_market_value_raw,
-      proposed_market_value_raw_currency, created_at, updated_at
+      proposed_market_value_currency, created_at, updated_at
     ) VALUES (
       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?), FROM_UNIXTIME(?), ?, ?, NOW(), NOW()
-    );
+    )
+    ON DUPLICATE KEY UPDATE
+      name = VALUES(name),
+      first_name = VALUES(first_name),
+      slug = VALUES(slug),
+      short_name = VALUES(short_name),
+      team_id = VALUES(team_id),
+      tournament_id = VALUES(tournament_id),
+      unique_tournament_id = VALUES(unique_tournament_id),
+      position = VALUES(position),
+      jersey_number = VALUES(jersey_number),
+      height = VALUES(height),
+      preferred_foot = VALUES(preferred_foot),
+      user_count = VALUES(user_count),
+      deceased = VALUES(deceased),
+      gender = VALUES(gender),
+      country_alpha2 = VALUES(country_alpha2),
+      country_alpha3 = VALUES(country_alpha3),
+      country_name = VALUES(country_name),
+      country_slug = VALUES(country_slug),
+      shirt_number = VALUES(shirt_number),
+      date_of_birth_timestamp = FROM_UNIXTIME(?),
+      contract_until_timestamp = FROM_UNIXTIME(?),
+      proposed_market_value_raw = VALUES(proposed_market_value_raw),
+      proposed_market_value_currency = VALUES(proposed_market_value_currency),
+      updated_at = NOW();
   `;
 
-      const values = [
+      const rawValues = [
         player.id,
         player.name,
         player.firstName,
@@ -330,20 +558,27 @@ async function processSources(index = 0, sources = []) {
         player.country?.name || null,
         player.country?.slug || null,
         player.shirtNumber || null,
-        player.dateOfBirthTimestamp || null,
-        player.contractUntilTimestamp || null,
+        player.dateOfBirthTimestamp || null, // FROM_UNIXTIME(?)
+        player.contractUntilTimestamp || null, // FROM_UNIXTIME(?)
         player.proposedMarketValueRaw?.value || null,
         player.proposedMarketValueRaw?.currency || null,
+        player.dateOfBirthTimestamp || null, // EXTRA for ON DUPLICATE KEY UPDATE
+        player.contractUntilTimestamp || null, // EXTRA for ON DUPLICATE KEY UPDATE
       ];
+
+      const values = sanitizeValues(rawValues);
 
       try {
         const [result] = await pool.execute(query, values);
-        console.log("Insert successful:", result.insertId);
         return result;
       } catch (error) {
         console.error("Insert failed:", error.message);
         throw error;
       }
+    }
+
+    function sanitizeValues(values) {
+      return values.map((v) => (v === undefined ? null : v));
     }
 
     async function fetchPlayerData(playerId) {
@@ -355,8 +590,7 @@ async function processSources(index = 0, sources = []) {
           );
           return await res.json();
         }, playerId);
-        savePlayerDetails(playerDetails?.player);
-        // TODO: Save playerDetails to sofascore_player table
+        await savePlayerDetails(playerDetails?.player);
 
         // 2) Player Characteristics & Position
         const playerCharacteristics = await page.evaluate(async (id) => {
@@ -366,20 +600,7 @@ async function processSources(index = 0, sources = []) {
           return await res.json();
         }, playerId);
 
-        // playerCharacteristics.positions.map((item) => {
-        //   console.log(item);
-        // });
-        savePlayerPositions(playerId, playerCharacteristics.positions);
-
-        // console.log(
-        //   `✅ Player ${playerId} characteristics:`,
-        //   playerCharacteristics
-        // );
-
-        // TODO:
-        // - Check if position exists in sofascore_position
-        // - If not, insert it
-        // - Then add to sofascore_player_position table
+        await savePlayerPositions(playerId, playerCharacteristics.positions);
 
         // 3) Player Statistics
         const playerStatistics = await page.evaluate(async (id) => {
@@ -388,11 +609,9 @@ async function processSources(index = 0, sources = []) {
           );
           return await res.json();
         }, playerId);
-        console.log(`✅ Player ${playerId} statistics:`, playerStatistics);
-        playerStatistics.seasons?.map((item) => {
-          savePlayerStatistics(playerId, item);
+        playerStatistics.seasons?.map(async (item) => {
+          await savePlayerStatistics(playerId, item);
         });
-        // TODO: Save playerStatistics to sofascore_player_statistics
       } catch (err) {
         console.error(
           `❌ Error fetching data for player ${playerId}:`,
@@ -415,10 +634,10 @@ async function processSources(index = 0, sources = []) {
 
     await browser.close();
 
-    // await processSources(index + 1, sources);
+    await processSources(index + 1, sources);
   } catch (error) {
     console.error(`❌ Error for source ID ${current.id}:`, error.message);
-    // await processSources(index + 1, sources); // Continue even if one fails
+    await processSources(index + 1, sources); // Continue even if one fails
   }
 }
 
