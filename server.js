@@ -2,42 +2,208 @@ const http = require("http");
 const pool = require("./db");
 const { PORT } = require("./config");
 const puppeteer = require("puppeteer");
+const { default: axios } = require("axios");
 
 async function processSources(index = 0, sources = []) {
+  const API_KEY = "2ac18ab6d1394c81be65cdd16b406082";
+
   if (index >= sources.length) {
     console.log("No more data to fetch");
     return;
   }
 
   const current = sources[index];
+  const now = new Date();
 
-  try {
-    const browser = await puppeteer.launch();
-    const page = await browser.newPage();
+  //function to decode the data
+  function decodeAndParseJSON(base64Body) {
+    try {
+      const decodedString = Buffer.from(base64Body, "base64").toString("utf-8");
 
-    await page.goto(
-      `https://www.sofascore.com/api/v1/team/${current.club_identifier}/standings/seasons`,
+      // Check if it's an HTML error page
+      if (decodedString.trim().startsWith("<")) {
+        console.warn("⚠️ Received HTML instead of JSON.");
+        console.log(decodedString); // Optional: log the HTML for debugging
+        return null;
+      }
+
+      // Parse and return the JSON
+      return JSON.parse(decodedString);
+    } catch (error) {
+      console.error("❌ Error decoding or parsing JSON:", error);
+      return null;
+    }
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  const seasons = await axios.post(
+    "https://api.zyte.com/v1/extract",
+    {
+      url: `https://www.sofascore.com/api/v1/team/${current.club_identifier}/standings/seasons`,
+      httpResponseBody: true,
+      httpRequestMethod: "GET",
+    },
+    {
+      auth: {
+        username: API_KEY,
+      },
+    }
+  );
+  const allSeasonsData = await decodeAndParseJSON(
+    seasons.data.httpResponseBody
+  );
+  const data = (await allSeasonsData?.tournamentSeasons) || [];
+  if (seasons.data.statusCode === 200) {
+    if (data.length > 0) {
+      //add categories in table sofascore_categories
+      const categories = new Map();
+
+      await data.forEach((tournamentSeason) => {
+        const cat = tournamentSeason.tournament.category;
+        if (!categories.has(cat.id)) {
+          categories.set(cat.id, {
+            id: cat.id,
+            name: cat.name,
+            slug: cat.slug,
+          });
+        }
+      });
+
+      for (const category of categories.values()) {
+        await pool.query(
+          `INSERT INTO sofascore_categories (id, name, slug,created_at, updated_at)
+         VALUES (?, ?, ?,?,?)
+         ON DUPLICATE KEY UPDATE 
+     name = VALUES(name), 
+     slug = VALUES(slug), 
+     updated_at = VALUES(updated_at)`,
+          [category.id, category.name, category.slug, now, now]
+        );
+      }
+
+      //add tournaments in table sofascore_tournaments
+      const tournaments = Object.values(
+        await data.reduce((acc, ts) => {
+          const t = ts.tournament;
+          if (!acc[t.id]) {
+            acc[t.id] = {
+              id: t.id,
+              name: t.name,
+              slug: t.slug,
+              category_id: t.category.id,
+              unique_tournament_id: t.uniqueTournament.id,
+            };
+          }
+          return acc;
+        }, {})
+      );
+
+      for (const {
+        id,
+        name,
+        slug,
+        category_id,
+        unique_tournament_id,
+      } of tournaments) {
+        await pool.query(
+          `INSERT INTO sofascore_tournaments (id, name, slug, category_id, unique_tournament_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE 
+       name = VALUES(name), 
+       slug = VALUES(slug), 
+       category_id = VALUES(category_id),
+       unique_tournament_id = VALUES(unique_tournament_id),
+       updated_at = VALUES(updated_at)`,
+          [id, name, slug, category_id, unique_tournament_id, now, now]
+        );
+      }
+      //add seasons in table sofascore_seasons
+      const seasonsMap = new Map();
+
+      await data.forEach(({ seasons }) => {
+        seasons.forEach(({ id, name, year }) => {
+          if (!seasonsMap.has(id)) {
+            seasonsMap.set(id, { id, name, year });
+          }
+        });
+      });
+
+      for (const { id, name, year } of seasonsMap.values()) {
+        await pool.query(
+          `INSERT INTO sofascore_seasons (id, name, year, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE 
+       name = VALUES(name), 
+       year = VALUES(year), 
+       updated_at = VALUES(updated_at)`,
+          [id, name, year, now, now]
+        );
+      }
+
+      //add seasons in table sofascore_season_tournament_season
+      for (const { tournament, seasons } of data) {
+        for (const { id: seasonId } of seasons) {
+          await pool.query(
+            `INSERT INTO sofascore_tournament_season (sofascore_tournament_id, sofascore_season_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE 
+         sofascore_tournament_id = VALUES(sofascore_tournament_id),
+         sofascore_season_id = VALUES(sofascore_season_id),
+         updated_at = VALUES(updated_at)`,
+            [tournament.uniqueTournament.id, seasonId, now, now]
+          );
+        }
+      }
+    }
+    const response = await axios.post(
+      "https://api.zyte.com/v1/extract",
       {
-        waitUntil: "networkidle2",
+        url: `https://www.sofascore.com/api/v1/team/${current.club_identifier}/performance`,
+        httpResponseBody: true,
+        httpRequestMethod: "GET",
+      },
+      {
+        auth: {
+          username: API_KEY,
+        },
       }
     );
 
-    //to add fixtures
+    if (response.data.statusCode === 200) {
+      const fixturePageDetails = await decodeAndParseJSON(
+        response.data.httpResponseBody
+      );
 
-    const saveFixtures = async (fixture) => {
-      const normalizeValues = (arr) =>
-        arr.map((v) => (v === undefined ? null : v));
+      await fixturePageDetails?.events?.map((item) => {
+        saveFixtures(item);
+      });
+    } else {
+      await processSources(index, sources);
+    }
+    //TODO: +1 logic here
+  } else {
+    await processSources(index, sources);
+  }
 
-      try {
-        // Check if the fixture already exists in the database
-        const [existingFixtureRows] = await pool.query(
-          "SELECT id FROM sofascore_fixture WHERE id = ?",
-          [fixture.id]
-        );
+  //to add fixtures
 
-        if (existingFixtureRows.length > 0) {
-          // If fixture exists, perform an UPDATE
-          const updateQuery = `
+  const saveFixtures = async (fixture) => {
+    const normalizeValues = (arr) =>
+      arr.map((v) => (v === undefined ? null : v));
+
+    try {
+      // Check if the fixture already exists in the database
+      const [existingFixtureRows] = await pool.query(
+        "SELECT id FROM sofascore_fixture WHERE id = ?",
+        [fixture.id]
+      );
+
+      if (existingFixtureRows.length > 0) {
+        // If fixture exists, perform an UPDATE
+        const updateQuery = `
         UPDATE sofascore_fixture
         SET 
           slug = ?, tournament_id = ?, unique_tournament_id = ?, season_id = ?,
@@ -50,35 +216,35 @@ async function processSources(index = 0, sources = []) {
         WHERE id = ?
       `;
 
-          const updateValues = [
-            fixture.slug,
-            fixture.tournament?.id,
-            fixture.tournament?.uniqueTournament?.id,
-            fixture.season?.id,
-            fixture.roundInfo?.round,
-            fixture.status?.type,
-            fixture.winnerCode,
-            fixture.homeTeam?.id,
-            fixture.awayTeam?.id,
-            fixture.homeScore?.current,
-            fixture.homeScore?.display,
-            fixture.homeScore?.period1,
-            fixture.homeScore?.period2,
-            fixture.homeScore?.normalTime,
-            fixture.awayScore?.current,
-            fixture.awayScore?.display,
-            fixture.awayScore?.period1,
-            fixture.awayScore?.period2,
-            fixture.awayScore?.normalTime,
-            fixture.startTimestamp,
-            fixture.startTimestamp,
-            fixture.id,
-          ];
+        const updateValues = [
+          fixture.slug,
+          fixture.tournament?.id,
+          fixture.tournament?.uniqueTournament?.id,
+          fixture.season?.id,
+          fixture.roundInfo?.round,
+          fixture.status?.type,
+          fixture.winnerCode,
+          fixture.homeTeam?.id,
+          fixture.awayTeam?.id,
+          fixture.homeScore?.current,
+          fixture.homeScore?.display,
+          fixture.homeScore?.period1,
+          fixture.homeScore?.period2,
+          fixture.homeScore?.normalTime,
+          fixture.awayScore?.current,
+          fixture.awayScore?.display,
+          fixture.awayScore?.period1,
+          fixture.awayScore?.period2,
+          fixture.awayScore?.normalTime,
+          fixture.startTimestamp,
+          fixture.startTimestamp,
+          fixture.id,
+        ];
 
-          await pool.execute(updateQuery, normalizeValues(updateValues));
-        } else {
-          // If fixture does not exist, perform an INSERT
-          const insertQuery = `
+        await pool.execute(updateQuery, normalizeValues(updateValues));
+      } else {
+        // If fixture does not exist, perform an INSERT
+        const insertQuery = `
         INSERT INTO sofascore_fixture (
           id, slug, tournament_id, unique_tournament_id, season_id,
           round_info, status_type, winner_code, home_team, away_team,
@@ -92,295 +258,183 @@ async function processSources(index = 0, sources = []) {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
       `;
 
-          const insertValues = [
-            fixture.id,
-            fixture.slug,
-            fixture.tournament?.id,
+        const insertValues = [
+          fixture.id,
+          fixture.slug,
+          fixture.tournament?.id,
+          fixture.tournament?.uniqueTournament?.id,
+          fixture.season?.id,
+          fixture.roundInfo?.round,
+          fixture.status?.type,
+          fixture.winnerCode,
+          fixture.homeTeam?.id,
+          fixture.awayTeam?.id,
+          fixture.homeScore?.current,
+          fixture.homeScore?.display,
+          fixture.homeScore?.period1,
+          fixture.homeScore?.period2,
+          fixture.homeScore?.normalTime,
+          fixture.awayScore?.current,
+          fixture.awayScore?.display,
+          fixture.awayScore?.period1,
+          fixture.awayScore?.period2,
+          fixture.awayScore?.normalTime,
+          fixture.startTimestamp,
+          fixture.startTimestamp,
+        ];
+
+        await pool.execute(insertQuery, normalizeValues(insertValues));
+      }
+
+      // Handle team entries (home and away) in sofascore_club_scrap
+      if (fixture.homeTeam?.id) {
+        const [homeTeamRows] = await pool.query(
+          "SELECT id FROM sofascore_club_scrap WHERE club_identifier = ?",
+          [fixture.homeTeam.id]
+        );
+
+        if (homeTeamRows.length === 0) {
+          const insertHomeTeamQuery = `
+          INSERT INTO sofascore_club_scrap (league_id, club_name, club_link, club_slug, club_identifier, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, NOW(), NOW())
+        `;
+          await pool.query(insertHomeTeamQuery, [
             fixture.tournament?.uniqueTournament?.id,
-            fixture.season?.id,
-            fixture.roundInfo?.round,
-            fixture.status?.type,
-            fixture.winnerCode,
-            fixture.homeTeam?.id,
-            fixture.awayTeam?.id,
-            fixture.homeScore?.current,
-            fixture.homeScore?.display,
-            fixture.homeScore?.period1,
-            fixture.homeScore?.period2,
-            fixture.homeScore?.normalTime,
-            fixture.awayScore?.current,
-            fixture.awayScore?.display,
-            fixture.awayScore?.period1,
-            fixture.awayScore?.period2,
-            fixture.awayScore?.normalTime,
-            fixture.startTimestamp,
-            fixture.startTimestamp,
-          ];
-
-          await pool.execute(insertQuery, normalizeValues(insertValues));
+            fixture.homeTeam.name,
+            `https://www.sofascore.com/team/football/${fixture.homeTeam.slug}/${fixture.homeTeam.id}`,
+            fixture.homeTeam.slug,
+            fixture.homeTeam.id,
+          ]);
         }
+      }
 
-        // Handle team entries (home and away) in sofascore_club_scrap
-        if (fixture.homeTeam?.id) {
-          const [homeTeamRows] = await pool.query(
-            "SELECT id FROM sofascore_club_scrap WHERE club_identifier = ?",
-            [fixture.homeTeam.id]
-          );
+      if (fixture.awayTeam?.id) {
+        const [awayTeamRows] = await pool.query(
+          "SELECT id FROM sofascore_club_scrap WHERE club_identifier = ?",
+          [fixture.awayTeam.id]
+        );
 
-          if (homeTeamRows.length === 0) {
-            const insertHomeTeamQuery = `
+        if (awayTeamRows.length === 0) {
+          const insertAwayTeamQuery = `
           INSERT INTO sofascore_club_scrap (league_id, club_name, club_link, club_slug, club_identifier, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, NOW(), NOW())
         `;
-            await pool.query(insertHomeTeamQuery, [
-              fixture.tournament?.uniqueTournament?.id,
-              fixture.homeTeam.name,
-              `https://www.sofascore.com/team/football/${fixture.homeTeam.slug}/${fixture.homeTeam.id}`,
-              fixture.homeTeam.slug,
-              fixture.homeTeam.id,
-            ]);
-          }
+          await pool.query(insertAwayTeamQuery, [
+            fixture.tournament?.uniqueTournament?.id,
+            fixture.awayTeam.name,
+            `https://www.sofascore.com/team/football/${fixture.awayTeam.slug}/${fixture.awayTeam.id}`,
+            fixture.awayTeam.slug,
+            fixture.awayTeam.id,
+          ]);
         }
-
-        if (fixture.awayTeam?.id) {
-          const [awayTeamRows] = await pool.query(
-            "SELECT id FROM sofascore_club_scrap WHERE club_identifier = ?",
-            [fixture.awayTeam.id]
-          );
-
-          if (awayTeamRows.length === 0) {
-            const insertAwayTeamQuery = `
-          INSERT INTO sofascore_club_scrap (league_id, club_name, club_link, club_slug, club_identifier, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, NOW(), NOW())
-        `;
-            await pool.query(insertAwayTeamQuery, [
-              fixture.tournament?.uniqueTournament?.id,
-              fixture.awayTeam.name,
-              `https://www.sofascore.com/team/football/${fixture.awayTeam.slug}/${fixture.awayTeam.id}`,
-              fixture.awayTeam.slug,
-              fixture.awayTeam.id,
-            ]);
-          }
-        }
-      } catch (error) {
-        console.error("Insert or update failed:", error.message);
-        throw error;
       }
-    };
-
-    const fixturePageDetails = await page.evaluate(async (clubId) => {
-      const response = await fetch(
-        `https://www.sofascore.com/api/v1/team/${clubId}/performance/`,
-        {
-          method: "GET",
-          headers: {
-            accept: "application/json",
-          },
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error(`HTTP error ${response.status}`);
-      }
-
-      return await response.json();
-    }, current.club_identifier);
-
-    await fixturePageDetails.events.map((item) => {
-      saveFixtures(item);
-    });
-
-    const body = await page.evaluate(() => document.body.innerText);
-
-    //add categories in table sofascore_categories
-    const categories = new Map();
-
-    const data = await JSON.parse(body).tournamentSeasons;
-    const now = new Date();
-
-    await data.forEach((tournamentSeason) => {
-      const cat = tournamentSeason.tournament.category;
-      if (!categories.has(cat.id)) {
-        categories.set(cat.id, {
-          id: cat.id,
-          name: cat.name,
-          slug: cat.slug,
-        });
-      }
-    });
-
-    for (const category of categories.values()) {
-      await pool.query(
-        `INSERT INTO sofascore_categories (id, name, slug,created_at, updated_at)
-         VALUES (?, ?, ?,?,?)
-         ON DUPLICATE KEY UPDATE 
-     name = VALUES(name), 
-     slug = VALUES(slug), 
-     updated_at = VALUES(updated_at)`,
-        [category.id, category.name, category.slug, now, now]
-      );
+    } catch (error) {
+      console.error("Insert or update failed:", error.message);
+      throw error;
     }
+  };
 
-    //add tournaments in table sofascore_tournaments
-    const tournaments = Object.values(
-      await data.reduce((acc, ts) => {
-        const t = ts.tournament;
-        if (!acc[t.id]) {
-          acc[t.id] = {
-            id: t.id,
-            name: t.name,
-            slug: t.slug,
-            category_id: t.category.id,
-            unique_tournament_id: t.uniqueTournament.id,
-          };
-        }
-        return acc;
-      }, {})
+  await sleep(5000);
+
+  //now get players from tournament and season
+  async function getTournamentSeasons() {
+    const [rows] = await pool.query(
+      `SELECT sofascore_tournament_id, sofascore_season_id FROM sofascore_tournament_season`
     );
+    return rows;
+  }
 
-    for (const {
-      id,
-      name,
-      slug,
-      category_id,
-      unique_tournament_id,
-    } of tournaments) {
-      await pool.query(
-        `INSERT INTO sofascore_tournaments (id, name, slug, category_id, unique_tournament_id, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE 
-       name = VALUES(name), 
-       slug = VALUES(slug), 
-       category_id = VALUES(category_id),
-       unique_tournament_id = VALUES(unique_tournament_id),
-       updated_at = VALUES(updated_at)`,
-        [id, name, slug, category_id, unique_tournament_id, now, now]
-      );
-    }
+  async function fetchPaginatedStatistics(tournamentId, seasonId) {
+    const limit = 10;
+    let offset = 0;
+    let hasMore = true;
 
-    //add seasons in table sofascore_seasons
-    const seasonsMap = new Map();
+    while (hasMore) {
+      const url = `https://www.sofascore.com/api/v1/unique-tournament/${tournamentId}/season/${seasonId}/statistics?limit=${limit}&offset=${offset}`;
 
-    await data.forEach(({ seasons }) => {
-      seasons.forEach(({ id, name, year }) => {
-        if (!seasonsMap.has(id)) {
-          seasonsMap.set(id, { id, name, year });
-        }
-      });
-    });
+      try {
+        const response = await axios.post(
+          "https://api.zyte.com/v1/extract",
+          {
+            url: url,
+            httpResponseBody: true,
+            httpRequestMethod: "GET",
+          },
+          {
+            auth: {
+              username: API_KEY,
+            },
+          }
+        );
+        const data = await decodeAndParseJSON(response.data.httpResponseBody);
+        const delayBetweenRequests = 20000;
 
-    for (const { id, name, year } of seasonsMap.values()) {
-      await pool.query(
-        `INSERT INTO sofascore_seasons (id, name, year, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE 
-       name = VALUES(name), 
-       year = VALUES(year), 
-       updated_at = VALUES(updated_at)`,
-        [id, name, year, now, now]
-      );
-    }
+        //TODO: remove these below code after testing
 
-    //add seasons in table sofascore_season_tournament_season
-    for (const { tournament, seasons } of data) {
-      for (const { id: seasonId } of seasons) {
-        await pool.query(
-          `INSERT INTO sofascore_tournament_season (sofascore_tournament_id, sofascore_season_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE 
-         sofascore_tournament_id = VALUES(sofascore_tournament_id),
-         sofascore_season_id = VALUES(sofascore_season_id),
-         updated_at = VALUES(updated_at)`,
-          [tournament.uniqueTournament.id, seasonId, now, now]
+        data?.results?.forEach((player, index) => {
+          setTimeout(async () => {
+            //TODO: uncomment below line
+            await fetchPlayerData(player.player.id);
+          }, delayBetweenRequests);
+        });
+        // if (offset === data?.pages * 10 - 10) {
+        //   hasMore = false;
+        // }
+        //TODO: remove these hasMore it is
+        hasMore = false;
+        // offset += limit;
+      } catch (err) {
+        console.error(
+          `Puppeteer error for tournament ${tournamentId}, season ${seasonId}:`,
+          err.message
         );
       }
     }
+  }
 
-    //now get players from tournament and season
-    async function getTournamentSeasons() {
-      const [rows] = await pool.query(
-        `SELECT sofascore_tournament_id, sofascore_season_id FROM sofascore_tournament_season`
+  //for sofascore_player_position
+
+  async function savePlayerPositions(playerId, positions) {
+    for (const position of positions) {
+      // 1. Check if position exists
+      const [positionRows] = await pool.execute(
+        "SELECT id FROM sofascore_position WHERE name = ? LIMIT 1",
+        [position]
       );
-      return rows;
-    }
 
-    async function fetchPaginatedStatistics(tournamentId, seasonId) {
-      const limit = 10;
-      let offset = 0;
-      let hasMore = true;
+      let positionId;
 
-      while (hasMore) {
-        const url = `https://www.sofascore.com/api/v1/unique-tournament/${tournamentId}/season/${seasonId}/statistics?limit=${limit}&offset=${offset}`;
-
-        try {
-          const data = await page.evaluate(async (apiUrl) => {
-            const res = await fetch(apiUrl);
-            return await res.json();
-          }, url);
-
-          const delayBetweenRequests = 5000;
-
-          data?.results?.forEach((player, index) => {
-            setTimeout(() => {
-              fetchPlayerData(player.player.id);
-            }, delayBetweenRequests);
-          });
-          if (offset === data?.pages * 10 - 10) {
-            hasMore = false;
-          }
-          offset += limit;
-        } catch (err) {
-          console.error(
-            `Puppeteer error for tournament ${tournamentId}, season ${seasonId}:`,
-            err.message
-          );
-        }
-      }
-    }
-
-    //for sofascore_player_position
-
-    async function savePlayerPositions(playerId, positions) {
-      for (const position of positions) {
-        // 1. Check if position exists
-        const [positionRows] = await pool.execute(
-          "SELECT id FROM sofascore_position WHERE name = ? LIMIT 1",
+      if (positionRows.length === 0) {
+        // Insert if not exists
+        const [insertResult] = await pool.execute(
+          "INSERT INTO sofascore_position (name, created_at, updated_at) VALUES (?, NOW(), NOW())",
           [position]
         );
+        positionId = insertResult.insertId;
+      } else {
+        positionId = positionRows[0].id;
+      }
 
-        let positionId;
+      // 2. Insert into sofascore_player_position if not already there
+      const [existingPlayerPosition] = await pool.execute(
+        "SELECT * FROM sofascore_player_position WHERE player_id = ? AND position_id = ? LIMIT 1",
+        [playerId, positionId]
+      );
 
-        if (positionRows.length === 0) {
-          // Insert if not exists
-          const [insertResult] = await pool.execute(
-            "INSERT INTO sofascore_position (name, created_at, updated_at) VALUES (?, NOW(), NOW())",
-            [position]
-          );
-          positionId = insertResult.insertId;
-        } else {
-          positionId = positionRows[0].id;
-        }
-
-        // 2. Insert into sofascore_player_position if not already there
-        const [existingPlayerPosition] = await pool.execute(
-          "SELECT * FROM sofascore_player_position WHERE player_id = ? AND position_id = ? LIMIT 1",
+      if (existingPlayerPosition.length === 0) {
+        await pool.execute(
+          "INSERT INTO sofascore_player_position (player_id, position_id, created_at, updated_at) VALUES (?, ?, NOW(), NOW())",
           [playerId, positionId]
         );
-
-        if (existingPlayerPosition.length === 0) {
-          await pool.execute(
-            "INSERT INTO sofascore_player_position (player_id, position_id, created_at, updated_at) VALUES (?, ?, NOW(), NOW())",
-            [playerId, positionId]
-          );
-        } else {
-        }
+      } else {
       }
     }
+  }
 
-    //for sofascore_player_statistics
-    async function savePlayerStatistics(playerId, data) {
-      try {
-        const query = `
+  //for sofascore_player_statistics
+  async function savePlayerStatistics(playerId, data) {
+    try {
+      const query = `
       INSERT INTO sofascore_player_statistics (
         player_id, team_id, unique_tournament_id, year,
         accurate_crosses, accurate_crosses_percentage, accurate_long_balls, accurate_long_balls_percentage,
@@ -437,65 +491,66 @@ async function processSources(index = 0, sources = []) {
         updated_at = NOW()
     `;
 
-        const rawValues = [
-          playerId,
-          data.team?.id,
-          data.uniqueTournament?.id,
-          data.year,
-          data.statistics?.accurateCrosses,
-          data.statistics?.accurateCrossesPercentage,
-          data.statistics?.accurateLongBalls,
-          data.statistics?.accurateLongBallsPercentage,
-          data.statistics?.accuratePasses,
-          data.statistics?.accuratePassesPercentage,
-          data.statistics?.aerialDuelsWon,
-          data.statistics?.assists,
-          data.statistics?.bigChancesCreated,
-          data.statistics?.bigChancesMissed,
-          data.statistics?.blockedShots,
-          data.statistics?.cleanSheet,
-          data.statistics?.dribbledPast,
-          data.statistics?.errorLeadToGoal,
-          data.statistics?.expectedAssists,
-          data.statistics?.expectedGoals,
-          data.statistics?.goals,
-          data.statistics?.goalsAssistsSum,
-          data.statistics?.goalsConceded,
-          data.statistics?.interceptions,
-          data.statistics?.keyPasses,
-          data.statistics?.minutesPlayed,
-          data.statistics?.passToAssist,
-          data.statistics?.rating,
-          data.statistics?.redCards,
-          data.statistics?.saves,
-          data.statistics?.shotsOnTarget,
-          data.statistics?.successfulDribbles,
-          data.statistics?.tackles,
-          data.statistics?.totalShots,
-          data.statistics?.yellowCards,
-          data.statistics?.totalRating,
-          data.statistics?.countRating,
-          data.statistics?.totalLongBalls,
-          data.statistics?.totalCross,
-          data.statistics?.totalPasses,
-          data.statistics?.shotsFromInsideTheBox,
-          data.statistics?.appearances,
-          new Date(),
-          new Date(),
-        ];
+      const rawValues = [
+        playerId,
+        data.team?.id,
+        data.uniqueTournament?.id,
+        data.year,
+        data.statistics?.accurateCrosses,
+        data.statistics?.accurateCrossesPercentage,
+        data.statistics?.accurateLongBalls,
+        data.statistics?.accurateLongBallsPercentage,
+        data.statistics?.accuratePasses,
+        data.statistics?.accuratePassesPercentage,
+        data.statistics?.aerialDuelsWon,
+        data.statistics?.assists,
+        data.statistics?.bigChancesCreated,
+        data.statistics?.bigChancesMissed,
+        data.statistics?.blockedShots,
+        data.statistics?.cleanSheet,
+        data.statistics?.dribbledPast,
+        data.statistics?.errorLeadToGoal,
+        data.statistics?.expectedAssists,
+        data.statistics?.expectedGoals,
+        data.statistics?.goals,
+        data.statistics?.goalsAssistsSum,
+        data.statistics?.goalsConceded,
+        data.statistics?.interceptions,
+        data.statistics?.keyPasses,
+        data.statistics?.minutesPlayed,
+        data.statistics?.passToAssist,
+        data.statistics?.rating,
+        data.statistics?.redCards,
+        data.statistics?.saves,
+        data.statistics?.shotsOnTarget,
+        data.statistics?.successfulDribbles,
+        data.statistics?.tackles,
+        data.statistics?.totalShots,
+        data.statistics?.yellowCards,
+        data.statistics?.totalRating,
+        data.statistics?.countRating,
+        data.statistics?.totalLongBalls,
+        data.statistics?.totalCross,
+        data.statistics?.totalPasses,
+        data.statistics?.shotsFromInsideTheBox,
+        data.statistics?.appearances,
+        new Date(),
+        new Date(),
+      ];
 
-        const values = sanitizeValues(rawValues);
+      const values = sanitizeValues(rawValues);
 
-        await pool.execute(query, values);
-      } catch (err) {
-        console.error(
-          "❌ Error inserting/updating player statistics:",
-          err.message
-        );
-      }
+      await pool.execute(query, values);
+    } catch (err) {
+      console.error(
+        "❌ Error inserting/updating player statistics:",
+        err.message
+      );
     }
+  }
 
-    async function savePlayerDetails(player) {
+  async function savePlayerDetails(player) {
+    if (player.id) {
       const query = `
     INSERT INTO sofascore_player (
       id, name, first_name, slug, short_name, team_id, tournament_id, unique_tournament_id, position, jersey_number,
@@ -571,72 +626,107 @@ async function processSources(index = 0, sources = []) {
         throw error;
       }
     }
-
-    function sanitizeValues(values) {
-      return values.map((v) => (v === undefined ? null : v));
-    }
-
-    async function fetchPlayerData(playerId) {
-      try {
-        // 1) Player Details
-        const playerDetails = await page.evaluate(async (id) => {
-          const res = await fetch(
-            `https://www.sofascore.com/api/v1/player/${id}`
-          );
-          return await res.json();
-        }, playerId);
-        await savePlayerDetails(playerDetails?.player);
-
-        // 2) Player Characteristics & Position
-        const playerCharacteristics = await page.evaluate(async (id) => {
-          const res = await fetch(
-            `https://www.sofascore.com/api/v1/player/${id}/characteristics`
-          );
-          return await res.json();
-        }, playerId);
-
-        await savePlayerPositions(playerId, playerCharacteristics.positions);
-
-        // 3) Player Statistics
-        const playerStatistics = await page.evaluate(async (id) => {
-          const res = await fetch(
-            `https://www.sofascore.com/api/v1/player/${id}/statistics`
-          );
-          return await res.json();
-        }, playerId);
-        playerStatistics.seasons?.map(async (item) => {
-          await savePlayerStatistics(playerId, item);
-        });
-      } catch (err) {
-        console.error(
-          `❌ Error fetching data for player ${playerId}:`,
-          err.message
-        );
-      }
-    }
-
-    const tournamentSeasons = await getTournamentSeasons();
-
-    for (const {
-      sofascore_tournament_id,
-      sofascore_season_id,
-    } of tournamentSeasons) {
-      await fetchPaginatedStatistics(
-        sofascore_tournament_id,
-        sofascore_season_id
-      );
-    }
-
-    await browser.close();
-
-    await processSources(index + 1, sources);
-  } catch (error) {
-    console.error(
-      `❌ Error for source ID ${current.club_identifier}:`,
-      error.message
-    );
-    await processSources(index + 1, sources);
   }
+
+  function sanitizeValues(values) {
+    return values.map((v) => (v === undefined ? null : v));
+  }
+
+  async function fetchPlayerData(playerId) {
+    // 1) Player Details
+    const playerDetailResponse = await axios.post(
+      "https://api.zyte.com/v1/extract",
+      {
+        url: `https://www.sofascore.com/api/v1/player/${playerId}`,
+        httpResponseBody: true,
+        httpRequestMethod: "GET",
+      },
+      {
+        auth: {
+          username: API_KEY,
+        },
+      }
+    );
+
+    const playerDetails = await decodeAndParseJSON(
+      playerDetailResponse.data.httpResponseBody
+    );
+    await savePlayerDetails(playerDetails?.player);
+    await sleep(5000);
+
+    // 2) Player Characteristics & Position
+    const playerCharacteristicsResponse = await axios.post(
+      "https://api.zyte.com/v1/extract",
+      {
+        url: `https://www.sofascore.com/api/v1/player/${playerId}/characteristics`,
+        httpResponseBody: true,
+        httpRequestMethod: "GET",
+      },
+      {
+        auth: {
+          username: API_KEY,
+        },
+      }
+    );
+
+    if (playerCharacteristicsResponse.data.statusCode === 200) {
+      const playerCharacteristics = await decodeAndParseJSON(
+        playerCharacteristicsResponse.data.httpResponseBody
+      );
+
+      if (playerCharacteristicsResponse.data.statusCode === 200) {
+        await savePlayerPositions(playerId, playerCharacteristics.positions);
+      }
+    } else {
+      console.log(`${response.data.statusCode} error`);
+    }
+
+    await sleep(5000);
+    // 3) Player Statistics
+    const playerStatisticsResponse = await axios.post(
+      "https://api.zyte.com/v1/extract",
+      {
+        url: `https://www.sofascore.com/api/v1/player/${playerId}/statistics`,
+        httpResponseBody: true,
+        httpRequestMethod: "GET",
+      },
+      {
+        auth: {
+          username: API_KEY,
+        },
+      }
+    );
+    if (playerStatisticsResponse.data.statusCode === 200) {
+      const playerStatistics = await decodeAndParseJSON(
+        playerStatisticsResponse.data.httpResponseBody
+      );
+      playerStatistics.seasons?.map(async (item) => {
+        await savePlayerStatistics(playerId, item);
+      });
+    } else {
+      console.log(`${response.data.statusCode} error`);
+    }
+  }
+
+  const tournamentSeasons = await getTournamentSeasons();
+  await sleep(5000);
+  await fetchPaginatedStatistics(
+    tournamentSeasons?.[0]?.sofascore_tournament_id,
+    tournamentSeasons?.[0]?.sofascore_season_id
+  );
+
+  // for (const {
+  //   sofascore_tournament_id,
+  //   sofascore_season_id,
+  // } of tournamentSeasons) {
+  //   //TODO: uncomment below code
+  //   // await fetchPaginatedStatistics(
+  //   //   sofascore_tournament_id,
+  //   //   sofascore_season_id
+  //   // );
+  // }
+  //TODO: uncomment below code
+  // await processSources(index + 1, sources);
 }
 
 const server = http.createServer(async (req, res) => {
