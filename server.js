@@ -545,7 +545,7 @@ async function processSources(index = 0, sources = []) {
           url
         );
         const data = await decodeAndParseJSON(response.data.httpResponseBody);
-        const delayBetweenRequests = 20000;
+        const delayBetweenRequests = 10000;
 
         for (let index = 0; index < data?.results?.length; index++) {
           const player = data.results[index];
@@ -870,7 +870,7 @@ async function processSources(index = 0, sources = []) {
       playerDetailResponse.data.httpResponseBody
     );
     await savePlayerDetails(playerDetails?.player);
-    await sleep(10000);
+    await sleep(5000);
 
     // 2) Player Characteristics & Position
     const playerCharacteristicsResponse = await retryRequest(
@@ -879,7 +879,7 @@ async function processSources(index = 0, sources = []) {
       `player/${playerId}/characteristics`,
       async () => {
         if (nextPlayerId) {
-          await sleep(5000);
+          await sleep(2000);
           await getPlayerCharacteristics(nextPlayerId);
         }
       },
@@ -896,7 +896,7 @@ async function processSources(index = 0, sources = []) {
       }
     }
 
-    await sleep(10000);
+    await sleep(5000);
     // 3) Player Statistics
     const playerStatisticsResponse = await retryRequest(
       () => getPlayerStatistics(playerId),
@@ -921,11 +921,11 @@ async function processSources(index = 0, sources = []) {
         )
       );
     }
-    await sleep(10000);
+    await sleep(5000);
   }
 
   const tournamentSeasons = await getTournamentSeasons();
-  await sleep(5000);
+  await sleep(2000);
   for (const [
     index,
     { sofascore_tournament_id, sofascore_season_id },
