@@ -15,6 +15,129 @@ async function processSources(index = 0, sources = []) {
   const current = sources[index];
   const now = new Date();
 
+  //for delay
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function logToDatabase({
+    context,
+    url,
+    status,
+    attemptCount,
+    errorMessage = null,
+    responseCode = null,
+    responseBody = null,
+  }) {
+    await pool.execute(
+      `INSERT INTO api_request_logs (
+      context, url, status, attempt_count, error_message, response_code, response_body
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        context,
+        url,
+        status,
+        attemptCount,
+        errorMessage,
+        responseCode,
+        responseBody ? JSON.stringify(responseBody) : null,
+      ]
+    );
+  }
+
+  async function logToDatabaseFailed({
+    context,
+    url,
+    attemptCount,
+    errorMessage,
+  }) {
+    // Log to a separate table 'failed_requests'
+    const query = `
+    INSERT INTO failed_requests (context, url, attempt_count, error_message)
+    VALUES (?, ?, ?, ?)
+  `;
+
+    // Assume db.query is a function that executes SQL queries
+    await pool.query(query, [context, url, attemptCount, errorMessage]);
+  }
+
+  async function retryRequest(
+    fn,
+    retries = 2,
+    context = "Unknown Request",
+    next,
+    url = "Unknown URL"
+  ) {
+    let attempt = 0;
+    let response;
+
+    while (attempt <= retries) {
+      try {
+        response = await fn();
+        const code = response.data?.statusCode;
+
+        if (code === 200) {
+          await logToDatabase({
+            context,
+            url,
+            status: "success",
+            attemptCount: attempt + 1,
+            responseCode: code,
+            responseBody: response.data,
+          });
+          return response;
+        } else {
+          const isLastAttempt = attempt === retries;
+          if (isLastAttempt) {
+            await logToDatabaseFailed({
+              context,
+              url,
+              attemptCount: attempt + 1,
+              errorMessage: response?.data?.statusCode || "",
+            });
+            await sleep(5000);
+            await next();
+          } else {
+            await logToDatabase({
+              context,
+              url,
+              status: "failure",
+              attemptCount: attempt + 1,
+              errorMessage: response?.data?.statusCode || "",
+            });
+            attempt++;
+          }
+        }
+      } catch (error) {
+        const isLastAttempt = attempt === retries;
+
+        if (isLastAttempt) {
+          await logToDatabase({
+            context,
+            url,
+            status: "failure",
+            attemptCount: attempt + 1,
+            errorMessage: error.message,
+          });
+          await logToDatabaseFailed({
+            context,
+            url,
+            attemptCount: attempt + 1,
+            errorMessage: error.message,
+          });
+          await sleep(5000);
+          await next();
+          console.error(`❌ Retry limit exceeded for: ${context}`);
+          throw error;
+        }
+
+        await sleep(5000);
+        console.log(`🔁 Retrying [${context}] attempt ${attempt + 1}`);
+        attempt++;
+      }
+    }
+  }
+
   //function to decode the data
   function decodeAndParseJSON(base64Body) {
     try {
@@ -35,81 +158,58 @@ async function processSources(index = 0, sources = []) {
     }
   }
 
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  const seasons = await axios.post(
-    "https://api.zyte.com/v1/extract",
-    {
-      url: `https://www.sofascore.com/api/v1/team/${current.club_identifier}/standings/seasons`,
-      httpResponseBody: true,
-      httpRequestMethod: "GET",
-    },
-    {
-      auth: {
-        username: API_KEY,
-      },
-    }
-  );
-  const allSeasonsData = await decodeAndParseJSON(
-    seasons.data.httpResponseBody
-  );
-  const data = (await allSeasonsData?.tournamentSeasons) || [];
-  if (seasons.data.statusCode === 200) {
-    if (data.length > 0) {
-      //add categories in table sofascore_categories
-      const categories = new Map();
-
-      await data.forEach((tournamentSeason) => {
-        const cat = tournamentSeason.tournament.category;
-        if (!categories.has(cat.id)) {
-          categories.set(cat.id, {
-            id: cat.id,
-            name: cat.name,
-            slug: cat.slug,
-          });
-        }
-      });
-
-      for (const category of categories.values()) {
-        await pool.query(
-          `INSERT INTO sofascore_categories (id, name, slug,created_at, updated_at)
+  //save sofascore categories
+  async function saveSofaScoreCategories(data) {
+    const categories = new Map();
+    await data.forEach((tournamentSeason) => {
+      const cat = tournamentSeason.tournament.category;
+      if (!categories.has(cat.id)) {
+        categories.set(cat.id, {
+          id: cat.id,
+          name: cat.name,
+          slug: cat.slug,
+        });
+      }
+    });
+    for (const category of categories.values()) {
+      await pool.query(
+        `INSERT INTO sofascore_categories (id, name, slug,created_at, updated_at)
          VALUES (?, ?, ?,?,?)
          ON DUPLICATE KEY UPDATE 
      name = VALUES(name), 
      slug = VALUES(slug), 
      updated_at = VALUES(updated_at)`,
-          [category.id, category.name, category.slug, now, now]
-        );
-      }
-
-      //add tournaments in table sofascore_tournaments
-      const tournaments = Object.values(
-        await data.reduce((acc, ts) => {
-          const t = ts.tournament;
-          if (!acc[t.id]) {
-            acc[t.id] = {
-              id: t.id,
-              name: t.name,
-              slug: t.slug,
-              category_id: t.category.id,
-              unique_tournament_id: t.uniqueTournament.id,
-            };
-          }
-          return acc;
-        }, {})
+        [category.id, category.name, category.slug, now, now]
       );
+    }
+  }
 
-      for (const {
-        id,
-        name,
-        slug,
-        category_id,
-        unique_tournament_id,
-      } of tournaments) {
-        await pool.query(
-          `INSERT INTO sofascore_tournaments (id, name, slug, category_id, unique_tournament_id, created_at, updated_at)
+  //save sofascore tournaments
+  async function saveSofaScoreTournaments(data) {
+    const tournaments = Object.values(
+      await data.reduce((acc, ts) => {
+        const t = ts.tournament;
+        if (!acc[t.id]) {
+          acc[t.id] = {
+            id: t.id,
+            name: t.name,
+            slug: t.slug,
+            category_id: t.category.id,
+            unique_tournament_id: t.uniqueTournament.id,
+          };
+        }
+        return acc;
+      }, {})
+    );
+    for (const {
+      id,
+      name,
+      slug,
+      category_id,
+      unique_tournament_id,
+    } of tournaments) {
+      await pool.query(
+        `INSERT INTO sofascore_tournaments (id, name, slug, category_id, unique_tournament_id, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE 
        name = VALUES(name), 
@@ -117,76 +217,73 @@ async function processSources(index = 0, sources = []) {
        category_id = VALUES(category_id),
        unique_tournament_id = VALUES(unique_tournament_id),
        updated_at = VALUES(updated_at)`,
-          [id, name, slug, category_id, unique_tournament_id, now, now]
-        );
-      }
-      //add seasons in table sofascore_seasons
-      const seasonsMap = new Map();
+        [id, name, slug, category_id, unique_tournament_id, now, now]
+      );
+    }
+  }
 
-      await data.forEach(({ seasons }) => {
-        seasons.forEach(({ id, name, year }) => {
-          if (!seasonsMap.has(id)) {
-            seasonsMap.set(id, { id, name, year });
-          }
-        });
+  //save sofascore seasons
+  async function saveSofaScoreSeasons(data) {
+    const seasonsMap = new Map();
+
+    await data.forEach(({ seasons }) => {
+      seasons.forEach(({ id, name, year }) => {
+        if (!seasonsMap.has(id)) {
+          seasonsMap.set(id, { id, name, year });
+        }
       });
+    });
 
-      for (const { id, name, year } of seasonsMap.values()) {
-        await pool.query(
-          `INSERT INTO sofascore_seasons (id, name, year, created_at, updated_at)
+    for (const { id, name, year } of seasonsMap.values()) {
+      await pool.query(
+        `INSERT INTO sofascore_seasons (id, name, year, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE 
        name = VALUES(name), 
        year = VALUES(year), 
        updated_at = VALUES(updated_at)`,
-          [id, name, year, now, now]
-        );
-      }
+        [id, name, year, now, now]
+      );
+    }
 
-      //add seasons in table sofascore_season_tournament_season
-      for (const { tournament, seasons } of data) {
-        for (const { id: seasonId } of seasons) {
-          await pool.query(
-            `INSERT INTO sofascore_tournament_season (sofascore_tournament_id, sofascore_season_id, created_at, updated_at)
+    //add seasons in table sofascore_season_tournament_season
+    for (const { tournament, seasons } of data) {
+      for (const { id: seasonId } of seasons) {
+        await pool.query(
+          `INSERT INTO sofascore_tournament_season (sofascore_tournament_id, sofascore_season_id, created_at, updated_at)
        VALUES (?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE 
          sofascore_tournament_id = VALUES(sofascore_tournament_id),
          sofascore_season_id = VALUES(sofascore_season_id),
          updated_at = VALUES(updated_at)`,
-            [tournament.uniqueTournament.id, seasonId, now, now]
-          );
-        }
+          [tournament.uniqueTournament.id, seasonId, now, now]
+        );
       }
     }
-    const response = await axios.post(
-      "https://api.zyte.com/v1/extract",
-      {
-        url: `https://www.sofascore.com/api/v1/team/${current.club_identifier}/performance`,
-        httpResponseBody: true,
-        httpRequestMethod: "GET",
-      },
-      {
-        auth: {
-          username: API_KEY,
-        },
-      }
-    );
-
-    if (response.data.statusCode === 200) {
-      const fixturePageDetails = await decodeAndParseJSON(
-        response.data.httpResponseBody
-      );
-
-      await fixturePageDetails?.events?.map((item) => {
-        saveFixtures(item);
-      });
-    } else {
-      await processSources(index, sources);
-    }
-    //TODO: +1 logic here
-  } else {
-    await processSources(index, sources);
   }
+
+  const seasons = await retryRequest(
+    () =>
+      axios.post(
+        "https://api.zyte.com/v1/extract",
+        {
+          url: `https://www.sofascore.com/api/v1/team/${current.club_identifier}/standings/seasons`,
+          httpResponseBody: true,
+          httpRequestMethod: "GET",
+        },
+        {
+          auth: { username: API_KEY },
+        }
+      ),
+    2,
+    `Seasons for club ${current.club_identifier}`,
+    async () => {
+      if (index < sources.length) {
+        await processSources(index + 1, sources);
+      }
+    },
+    `https://www.sofascore.com/api/v1/team/${current.club_identifier}/standings/seasons`
+  );
 
   //to add fixtures
 
@@ -334,29 +431,27 @@ async function processSources(index = 0, sources = []) {
     }
   };
 
-  await sleep(5000);
+  const allSeasonsData = await decodeAndParseJSON(
+    seasons.data.httpResponseBody
+  );
+  const data = (await allSeasonsData?.tournamentSeasons) || [];
+  if (seasons.data.statusCode === 200) {
+    if (data.length > 0) {
+      //add categories in table sofascore_categories
+      await saveSofaScoreCategories(data);
 
-  //now get players from tournament and season
-  async function getTournamentSeasons() {
-    const [rows] = await pool.query(
-      `SELECT sofascore_tournament_id, sofascore_season_id FROM sofascore_tournament_season`
-    );
-    return rows;
-  }
+      //add tournaments in table sofascore_tournaments
+      await saveSofaScoreTournaments(data);
 
-  async function fetchPaginatedStatistics(tournamentId, seasonId) {
-    const limit = 10;
-    let offset = 0;
-    let hasMore = true;
-
-    while (hasMore) {
-      const url = `https://www.sofascore.com/api/v1/unique-tournament/${tournamentId}/season/${seasonId}/statistics?limit=${limit}&offset=${offset}`;
-
-      try {
-        const response = await axios.post(
+      //add seasons in table sofascore_seasons
+      await saveSofaScoreSeasons(data);
+    }
+    const response = await retryRequest(
+      () =>
+        axios.post(
           "https://api.zyte.com/v1/extract",
           {
-            url: url,
+            url: `https://www.sofascore.com/api/v1/team/${current.club_identifier}/performance`,
             httpResponseBody: true,
             httpRequestMethod: "GET",
           },
@@ -365,24 +460,106 @@ async function processSources(index = 0, sources = []) {
               username: API_KEY,
             },
           }
+        ),
+      2,
+      `fixtures for club ${current.club_identifier}`,
+      async () => {
+        if (index < sources.length) {
+          await processSources(index + 1, sources);
+        }
+      },
+      `https://www.sofascore.com/api/v1/team/${current.club_identifier}/performance`
+    );
+
+    if (response.data.statusCode === 200) {
+      const fixturePageDetails = await decodeAndParseJSON(
+        response.data.httpResponseBody
+      );
+
+      await fixturePageDetails?.events?.map((item) => {
+        saveFixtures(item);
+      });
+      async () => {
+        if (index < sources.length) {
+          await processSources(index + 1, sources);
+        }
+      };
+    }
+  } else {
+    console.log("else triggered , 235");
+  }
+
+  await sleep(5000);
+
+  //now get players from tournament and season
+
+  const getPlayersList = async (url) => {
+    return await axios.post(
+      "https://api.zyte.com/v1/extract",
+      {
+        url: url,
+        httpResponseBody: true,
+        httpRequestMethod: "GET",
+      },
+      {
+        auth: {
+          username: API_KEY,
+        },
+      }
+    );
+  };
+
+  async function getTournamentSeasons() {
+    const [rows] = await pool.query(
+      `SELECT sofascore_tournament_id, sofascore_season_id FROM sofascore_tournament_season`
+    );
+    return rows;
+  }
+
+  async function fetchPaginatedStatistics(tournamentId, seasonId, index) {
+    const limit = 10;
+    let offset = 0;
+    let hasMore = true;
+
+    while (hasMore) {
+      const url = `https://www.sofascore.com/api/v1/unique-tournament/${tournamentId}/season/${seasonId}/statistics?limit=${limit}&offset=${offset}`;
+
+      try {
+        const response = await retryRequest(
+          () => getPlayersList(url),
+          2,
+          `unique-tournament/${tournamentId}/season/${seasonId}/statistics`,
+          () => {
+            hasMore
+              ? getPlayersList(
+                  `https://www.sofascore.com/api/v1/unique-tournament/${tournamentId}/season/${seasonId}/statistics?limit=${limit}&offset=${
+                    offset + 10
+                  }`
+                )
+              : fetchPaginatedStatistics(
+                  tournamentSeasons?.[index + 1]?.sofascore_tournament_id,
+                  tournamentSeasons?.[index + 1]?.sofascore_season_id,
+                  index + 1
+                );
+          },
+          url
         );
         const data = await decodeAndParseJSON(response.data.httpResponseBody);
         const delayBetweenRequests = 20000;
 
-        //TODO: remove these below code after testing
+        for (let index = 0; index < data?.results?.length; index++) {
+          const player = data.results[index];
+          const nextPlayer = data.results[index + 1];
 
-        data?.results?.forEach((player, index) => {
-          setTimeout(async () => {
-            //TODO: uncomment below line
-            await fetchPlayerData(player.player.id);
-          }, delayBetweenRequests);
-        });
-        // if (offset === data?.pages * 10 - 10) {
-        //   hasMore = false;
-        // }
-        //TODO: remove these hasMore it is
-        hasMore = false;
-        // offset += limit;
+          await fetchPlayerData(player.player.id, nextPlayer?.player?.id);
+          await sleep(delayBetweenRequests);
+        }
+
+        if (offset >= data.pages * limit - limit) {
+          hasMore = false;
+        } else {
+          offset += limit;
+        }
       } catch (err) {
         console.error(
           `Puppeteer error for tournament ${tournamentId}, season ${seasonId}:`,
@@ -632,41 +809,81 @@ async function processSources(index = 0, sources = []) {
     return values.map((v) => (v === undefined ? null : v));
   }
 
-  async function fetchPlayerData(playerId) {
-    // 1) Player Details
-    const playerDetailResponse = await axios.post(
-      "https://api.zyte.com/v1/extract",
-      {
-        url: `https://www.sofascore.com/api/v1/player/${playerId}`,
-        httpResponseBody: true,
-        httpRequestMethod: "GET",
-      },
-      {
-        auth: {
-          username: API_KEY,
+  async function fetchPlayerData(playerId, nextPlayerId) {
+    // 1. Player Details API
+    const getPlayerDetails = async (playerId) =>
+      await axios.post(
+        "https://api.zyte.com/v1/extract",
+        {
+          url: `https://www.sofascore.com/api/v1/player/${playerId}`,
+          httpResponseBody: true,
+          httpRequestMethod: "GET",
         },
-      }
+        {
+          auth: { username: API_KEY },
+        }
+      );
+
+    // 2. Player Characteristics API
+    const getPlayerCharacteristics = async (playerId) =>
+      await axios.post(
+        "https://api.zyte.com/v1/extract",
+        {
+          url: `https://www.sofascore.com/api/v1/player/${playerId}/characteristics`,
+          httpResponseBody: true,
+          httpRequestMethod: "GET",
+        },
+        {
+          auth: { username: API_KEY },
+        }
+      );
+
+    // 3. Player Statistics API
+    const getPlayerStatistics = async (playerId) =>
+      await axios.post(
+        "https://api.zyte.com/v1/extract",
+        {
+          url: `https://www.sofascore.com/api/v1/player/${playerId}/statistics`,
+          httpResponseBody: true,
+          httpRequestMethod: "GET",
+        },
+        {
+          auth: { username: API_KEY },
+        }
+      );
+
+    // 1) Player Details
+    const playerDetailResponse = await retryRequest(
+      () => getPlayerDetails(playerId),
+      2,
+      `api/v1/player/${playerId}`,
+      async () => {
+        if (nextPlayerId) {
+          await sleep(5000);
+          await getPlayerDetails(nextPlayerId);
+        }
+      },
+      `https://www.sofascore.com/api/v1/player/${playerId}`
     );
 
     const playerDetails = await decodeAndParseJSON(
       playerDetailResponse.data.httpResponseBody
     );
     await savePlayerDetails(playerDetails?.player);
-    await sleep(5000);
+    await sleep(10000);
 
     // 2) Player Characteristics & Position
-    const playerCharacteristicsResponse = await axios.post(
-      "https://api.zyte.com/v1/extract",
-      {
-        url: `https://www.sofascore.com/api/v1/player/${playerId}/characteristics`,
-        httpResponseBody: true,
-        httpRequestMethod: "GET",
+    const playerCharacteristicsResponse = await retryRequest(
+      () => getPlayerCharacteristics(playerId),
+      2,
+      `player/${playerId}/characteristics`,
+      async () => {
+        if (nextPlayerId) {
+          await sleep(5000);
+          await getPlayerCharacteristics(nextPlayerId);
+        }
       },
-      {
-        auth: {
-          username: API_KEY,
-        },
-      }
+      `https://www.sofascore.com/api/v1/player/${playerId}/characteristics`
     );
 
     if (playerCharacteristicsResponse.data.statusCode === 200) {
@@ -677,56 +894,48 @@ async function processSources(index = 0, sources = []) {
       if (playerCharacteristicsResponse.data.statusCode === 200) {
         await savePlayerPositions(playerId, playerCharacteristics.positions);
       }
-    } else {
-      console.log(`${response.data.statusCode} error`);
     }
 
-    await sleep(5000);
+    await sleep(10000);
     // 3) Player Statistics
-    const playerStatisticsResponse = await axios.post(
-      "https://api.zyte.com/v1/extract",
-      {
-        url: `https://www.sofascore.com/api/v1/player/${playerId}/statistics`,
-        httpResponseBody: true,
-        httpRequestMethod: "GET",
+    const playerStatisticsResponse = await retryRequest(
+      () => getPlayerStatistics(playerId),
+      2,
+      `player/${playerId}/statistics`,
+      async () => {
+        if (nextPlayerId) {
+          await sleep(5000);
+          await getPlayerStatistics(nextPlayerId);
+        }
       },
-      {
-        auth: {
-          username: API_KEY,
-        },
-      }
+      `https://www.sofascore.com/api/v1/player/${playerId}/statistics`
     );
     if (playerStatisticsResponse.data.statusCode === 200) {
       const playerStatistics = await decodeAndParseJSON(
         playerStatisticsResponse.data.httpResponseBody
       );
-      playerStatistics.seasons?.map(async (item) => {
-        await savePlayerStatistics(playerId, item);
-      });
-    } else {
-      console.log(`${response.data.statusCode} error`);
+      await sleep(2000);
+      await Promise.all(
+        playerStatistics.seasons?.map((item) =>
+          savePlayerStatistics(playerId, item)
+        )
+      );
     }
+    await sleep(10000);
   }
 
   const tournamentSeasons = await getTournamentSeasons();
   await sleep(5000);
-  await fetchPaginatedStatistics(
-    tournamentSeasons?.[0]?.sofascore_tournament_id,
-    tournamentSeasons?.[0]?.sofascore_season_id
-  );
-
-  // for (const {
-  //   sofascore_tournament_id,
-  //   sofascore_season_id,
-  // } of tournamentSeasons) {
-  //   //TODO: uncomment below code
-  //   // await fetchPaginatedStatistics(
-  //   //   sofascore_tournament_id,
-  //   //   sofascore_season_id
-  //   // );
-  // }
-  //TODO: uncomment below code
-  // await processSources(index + 1, sources);
+  for (const [
+    index,
+    { sofascore_tournament_id, sofascore_season_id },
+  ] of tournamentSeasons.entries()) {
+    await fetchPaginatedStatistics(
+      sofascore_tournament_id,
+      sofascore_season_id,
+      index
+    );
+  }
 }
 
 const server = http.createServer(async (req, res) => {
