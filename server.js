@@ -434,6 +434,17 @@ async function processSources(index = 0, sources = []) {
   const allSeasonsData = await decodeAndParseJSON(
     seasons.data.httpResponseBody
   );
+  function updateIsFetched(id) {
+    const query = `UPDATE sofascore_club_scrap SET isFetched = TRUE WHERE club_identifier = ?`;
+
+    pool.execute(query, [id], (err, results) => {
+      if (err) {
+        console.error("Error updating the row:", err);
+      } else {
+        console.log(`Successfully updated row with id ${id}.`);
+      }
+    });
+  }
   const data = (await allSeasonsData?.tournamentSeasons) || [];
   if (seasons.data.statusCode === 200) {
     if (data.length > 0) {
@@ -445,6 +456,7 @@ async function processSources(index = 0, sources = []) {
 
       //add seasons in table sofascore_seasons
       await saveSofaScoreSeasons(data);
+      updateIsFetched(current.club_identifier);
     }
     const response = await retryRequest(
       () =>
@@ -511,9 +523,26 @@ async function processSources(index = 0, sources = []) {
 
   async function getTournamentSeasons() {
     const [rows] = await pool.query(
-      `SELECT sofascore_tournament_id, sofascore_season_id FROM sofascore_tournament_season`
+      `SELECT sofascore_tournament_id, sofascore_season_id FROM sofascore_tournament_season WHERE isFetched = FALSE`
     );
     return rows;
+  }
+
+  function updateIsPlayerColumnFetched(tournamentId, seasonId) {
+    const query = `UPDATE sofascore_tournament_season 
+                 SET isFetched = TRUE 
+                 WHERE sofascore_tournament_id = ? 
+                 AND sofascore_season_id = ?`;
+
+    pool.execute(query, [tournamentId, seasonId], (err, results) => {
+      if (err) {
+        console.error("Error updating the row:", err);
+      } else {
+        console.log(
+          `Successfully updated isFetched to TRUE for tournamentId: ${tournamentId} and seasonId: ${seasonId}.`
+        );
+      }
+    });
   }
 
   async function fetchPaginatedStatistics(tournamentId, seasonId, index) {
@@ -559,6 +588,7 @@ async function processSources(index = 0, sources = []) {
 
         if (offset >= data.pages * limit - limit) {
           hasMore = false;
+          updateIsPlayerColumnFetched(tournamentId, seasonId);
         } else {
           offset += limit;
         }
@@ -953,7 +983,7 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const [rows] = await pool.query(
-        "SELECT * FROM sofascore_club_scrap ORDER BY id ASC"
+        "SELECT * FROM sofascore_club_scrap WHERE isFetched = FALSE ORDER BY id ASC"
       );
 
       if (rows.length === 0) {
