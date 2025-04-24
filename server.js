@@ -434,8 +434,8 @@ async function processSources(index = 0, sources = []) {
   const allSeasonsData = await decodeAndParseJSON(
     seasons.data.httpResponseBody
   );
-  function updateIsFetched(id) {
-    const query = `UPDATE sofascore_club_scrap SET isFetched = TRUE WHERE club_identifier = ?`;
+  function updateis_fetched(id) {
+    const query = `UPDATE sofascore_club_scrap SET is_fetched = TRUE WHERE club_identifier = ?`;
 
     pool.execute(query, [id], (err, results) => {
       if (err) {
@@ -456,7 +456,7 @@ async function processSources(index = 0, sources = []) {
 
       //add seasons in table sofascore_seasons
       await saveSofaScoreSeasons(data);
-      updateIsFetched(current.club_identifier);
+      updateis_fetched(current.club_identifier);
     }
     const response = await retryRequest(
       () =>
@@ -523,14 +523,14 @@ async function processSources(index = 0, sources = []) {
 
   async function getTournamentSeasons() {
     const [rows] = await pool.query(
-      `SELECT sofascore_tournament_id, sofascore_season_id FROM sofascore_tournament_season WHERE isFetched = FALSE`
+      `SELECT sofascore_tournament_id, sofascore_season_id FROM sofascore_tournament_season WHERE is_fetched = FALSE`
     );
     return rows;
   }
 
   function updateIsPlayerColumnFetched(tournamentId, seasonId) {
     const query = `UPDATE sofascore_tournament_season 
-                 SET isFetched = TRUE 
+                 SET is_fetched = TRUE 
                  WHERE sofascore_tournament_id = ? 
                  AND sofascore_season_id = ?`;
 
@@ -539,7 +539,7 @@ async function processSources(index = 0, sources = []) {
         console.error("Error updating the row:", err);
       } else {
         console.log(
-          `Successfully updated isFetched to TRUE for tournamentId: ${tournamentId} and seasonId: ${seasonId}.`
+          `Successfully updated is_fetched to TRUE for tournamentId: ${tournamentId} and seasonId: ${seasonId}.`
         );
       }
     });
@@ -983,7 +983,7 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const [rows] = await pool.query(
-        "SELECT * FROM sofascore_club_scrap WHERE isFetched = FALSE ORDER BY id ASC"
+        "SELECT * FROM sofascore_club_scrap WHERE is_fetched = FALSE ORDER BY id ASC"
       );
 
       if (rows.length === 0) {
