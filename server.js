@@ -547,12 +547,14 @@ async function processSources(index = 0, sources = []) {
         const data = await decodeAndParseJSON(response.data.httpResponseBody);
         const delayBetweenRequests = 10000;
 
-        for (let index = 0; index < data?.results?.length; index++) {
-          const player = data.results[index];
-          const nextPlayer = data.results[index + 1];
+        if (data?.results?.length > 0) {
+          for (let index = 0; index < data?.results?.length; index++) {
+            const player = data.results[index];
+            const nextPlayer = data.results[index + 1];
 
-          await fetchPlayerData(player.player.id, nextPlayer?.player?.id);
-          await sleep(delayBetweenRequests);
+            await fetchPlayerData(player.player.id, nextPlayer?.player?.id);
+            await sleep(delayBetweenRequests);
+          }
         }
 
         if (offset >= data.pages * limit - limit) {
